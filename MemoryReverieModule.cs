@@ -15,9 +15,9 @@ namespace Azuma.MemoryReverie;
 
 public class MemoryReverieConfig
 {
-    // ===== 回忆部分：从早期记忆中召回旧时光 =====
+    // ===== 回忆部分：从记忆存档中随机召回旧时光 =====
     [DisplayName("启用回忆")]
-    [Description("是否开启不定期从早期记忆中召回回忆")]
+    [Description("是否开启不定期随机召回记忆存档中的回忆")]
     public bool EnableMemoryRecall { get; set; } = true;
 
     [DisplayName("回忆最短间隔（分钟）")]
@@ -29,7 +29,7 @@ public class MemoryReverieConfig
     public int MemoryMaxIntervalMinutes { get; set; } = 720;
 
     [DisplayName("每次召回记忆条数")]
-    [Description("每次回忆时从早期记忆中召回的条数")]
+    [Description("每次回忆时从记忆存档中随机召回的条数")]
     public int RecallCount { get; set; } = 2;
 
     [DisplayName("最大记忆层级")]
@@ -52,12 +52,12 @@ public class MemoryReverieConfig
 
 /// <summary>
 /// 回忆与遐想模块（两个相互独立的部分，各自不定期触发）：
-/// 1. 回忆：在「最短~最长间隔」之间的随机周期，从角色的早期记忆存档中召回若干条带时间信息的回忆，让AI重温旧时光。
+/// 1. 回忆：在「最短~最长间隔」之间的随机周期，从角色的记忆存档中随机召回若干条带时间信息的回忆，让AI重温旧时光。
 /// 2. 遐想：在「最短~最长间隔」之间的随机周期，让AI抛开一切逻辑自由遐想、抒发情感与感慨（完全不依赖记忆）。
 /// 3. AI 也可以通过 XML 函数主动触发其中任意一种。
 /// </summary>
 [Module("回忆与遐想",
-    "不定期让AI从早期记忆中召回旧时光，也会不定期放空思绪自由遐想、抒发情感。",
+    "不定期让AI随机回忆记忆存档中的旧时光，也会不定期放空思绪自由遐想、抒发情感。",
     defaultCategory: "Azuma")]
 public class MemoryReverieModule(
     XmlFunctionCaller functionCaller,
@@ -74,11 +74,13 @@ public class MemoryReverieModule(
     bool memoryTriggering;
     bool reverieTriggering;
     string memoryRootPath = null!;
+    // 上一次抽中的存档名（避免连续两次抽到完全相同的组合）
+    readonly HashSet<string> lastPickedNames = new();
 
     // ===== AI 自助调用入口 =====
 
     [XmlFunction(FunctionMode.OneShot)]
-    [Description("立即从早期记忆中召回几条回忆（带时间信息），重温旧时光")]
+    [Description("立即从记忆存档中随机召回几条回忆（带时间信息），重温旧时光")]
     public Task TriggerMemoryRecall()
     {
         return DoMemoryRecall();
@@ -100,7 +102,7 @@ public class MemoryReverieModule(
         // 注册给 AI 的自助调用入口（隐式文档：调用时才注入说明，节省上下文）
         XmlHandler xmlHandler = new(this) {
             Description = "当你想要回忆往事、重温旧时光，或想放空思绪自由遐想、抒发情感时使用",
-            Explanation = "回忆与遐想：系统会不定期从你的早期记忆中召回若干条带时间信息的回忆让你重温；也会不定期让你抛开逻辑自由畅想、抒发情感与感慨。这两种都可以主动调用。"
+            Explanation = "回忆与遐想：系统会不定期从你的记忆存档中随机召回若干条带时间信息的回忆让你重温；也会不定期让你抛开逻辑自由畅想、抒发情感与感慨。这两种都可以主动调用。"
         };
         functionCaller.RegisterHandler(xmlHandler, DocumentMode.Implicit, DestroyCancellationToken);
 
@@ -160,7 +162,7 @@ public class MemoryReverieModule(
         memoryTriggering = true;
         try
         {
-            List<MemoryEntry> memories = LoadEarlyMemories(Configuration.RecallCount, Configuration.MaxLevel);
+            List<MemoryEntry> memories = LoadRandomMemories(Configuration.RecallCount, Configuration.MaxLevel);
 
             StringBuilder sb = new();
             sb.AppendLine("(回忆时间到)");
@@ -228,14 +230,14 @@ public class MemoryReverieModule(
         }
     }
 
-    // ===== 早期记忆读取 =====
+    // ===== 记忆存档读取与随机抽样 =====
 
     /// <summary>
-    /// 扫描角色记忆存档目录（Memory/L{层级}/*.txt），
-    /// 按记忆时间从早到晚排序，返回最早的 count 条（即「早期记忆」）。
+    /// 扫描角色记忆存档目录（Memory/L{层级}/*.txt）并均匀随机抽样，
+    /// 返回随机抽中的 count 条记忆（每条都带各自的时间信息）。
     /// 存档文件名格式：{Level}-{StartTime:yyyyMMddHHmmss}-{EndTime:yyyyMMddHHmmss}.txt
     /// </summary>
-    List<MemoryEntry> LoadEarlyMemories(int count, int maxLevel)
+    List<MemoryEntry> LoadRandomMemories(int count, int maxLevel)
     {
         List<MemoryEntry> entries = new();
 
@@ -257,10 +259,31 @@ public class MemoryReverieModule(
             }
         }
 
-        return entries
-            .OrderBy(entry => entry.EndTime)
-            .Take(count)
-            .ToList();
+        if (entries.Count == 0)
+            return entries;
+
+        // 存档足够多时，先排除上次抽中的存档，避免连续两次抽到完全相同的组合
+        List<MemoryEntry> pool = entries;
+        if (lastPickedNames.Count > 0 && entries.Count > count)
+        {
+            List<MemoryEntry> filtered = entries.Where(entry => lastPickedNames.Contains(entry.Name) == false).ToList();
+            if (filtered.Count >= count)
+                pool = filtered;
+        }
+
+        // Fisher-Yates 洗牌后取前 count 条 = 均匀随机、不放回抽样
+        for (int i = pool.Count - 1; i > 0; i--)
+        {
+            int j = Random.Shared.Next(i + 1);
+            (pool[i], pool[j]) = (pool[j], pool[i]);
+        }
+
+        List<MemoryEntry> picked = pool.Take(count).ToList();
+        lastPickedNames.Clear();
+        foreach (MemoryEntry entry in picked)
+            lastPickedNames.Add(entry.Name);
+
+        return picked;
     }
 
     bool TryParseArchiveFile(string file, out MemoryEntry entry)
@@ -294,7 +317,7 @@ public class MemoryReverieModule(
         if (string.IsNullOrWhiteSpace(summary))
             summary = text; // 解析失败时退化为整段文本
 
-        entry = new MemoryEntry(FormatTimeRange(startTime, endTime), summary, content, endTime);
+        entry = new MemoryEntry(fileName, FormatTimeRange(startTime, endTime), summary, content, endTime);
         return true;
     }
 
@@ -328,5 +351,5 @@ public class MemoryReverieModule(
     }
 }
 
-/// <summary>一条被召回的早期记忆</summary>
-public record MemoryEntry(string TimeRange, string Summary, string Content, DateTime EndTime);
+/// <summary>一条被召回的存档记忆（Name 为存档文件名，用于避免连续重复）</summary>
+public record MemoryEntry(string Name, string TimeRange, string Summary, string Content, DateTime EndTime);
